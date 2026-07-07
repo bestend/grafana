@@ -1,6 +1,8 @@
 package ofrep
 
 import (
+	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -10,8 +12,10 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	goffmodel "github.com/thomaspoignant/go-feature-flag/cmd/relayproxy/model"
 
 	"github.com/grafana/grafana/pkg/infra/log"
+	"github.com/grafana/grafana/pkg/services/featuremgmt"
 	"github.com/grafana/grafana/pkg/setting"
 )
 
@@ -81,4 +85,164 @@ func TestProxyUserAgent(t *testing.T) {
 			})
 		}
 	})
+}
+
+func decodeBulkFlagKeys(t *testing.T, w *httptest.ResponseRecorder) []string {
+	t.Helper()
+	var result goffmodel.OFREPBulkEvaluateSuccessResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &result))
+	keys := make([]string, 0, len(result.Flags))
+	for _, f := range result.Flags {
+		keys = append(keys, f.Key)
+	}
+	return keys
+}
+
+func TestProxyAllFlagReq_PublicMetadataFiltering(t *testing.T) {
+	flagsByMetadata := []goffmodel.OFREPFlagBulkEvaluateSuccessResponse{
+		{OFREPEvaluateSuccessResponse: goffmodel.OFREPEvaluateSuccessResponse{
+			Key: "publicBool", Value: true, Metadata: map[string]any{"public": true},
+		}},
+		{OFREPEvaluateSuccessResponse: goffmodel.OFREPEvaluateSuccessResponse{
+			Key: "publicString", Value: true, Metadata: map[string]any{"public": "true"},
+		}},
+		{OFREPEvaluateSuccessResponse: goffmodel.OFREPEvaluateSuccessResponse{
+			Key: "privateBool", Value: true, Metadata: map[string]any{"public": false},
+		}},
+		{OFREPEvaluateSuccessResponse: goffmodel.OFREPEvaluateSuccessResponse{
+			Key: "noMetadata", Value: true,
+		}},
+	}
+	onlyPrivateFlag := []goffmodel.OFREPFlagBulkEvaluateSuccessResponse{
+		{OFREPEvaluateSuccessResponse: goffmodel.OFREPEvaluateSuccessResponse{
+			Key: "privateBool", Metadata: map[string]any{"public": false},
+		}},
+	}
+
+	tests := []struct {
+		name           string
+		filteringOn    bool
+		isAuthedUser   bool
+		upstreamFlags  []goffmodel.OFREPFlagBulkEvaluateSuccessResponse
+		upstreamStatus int
+		wantStatus     int
+		wantKeys       []string // checked (and Flags asserted non-nil) only when wantStatus is 200
+	}{
+		{
+			name:           "flag on, authenticated: bulk response is filtered down to public-metadata flags only",
+			filteringOn:    true,
+			isAuthedUser:   true,
+			upstreamFlags:  flagsByMetadata,
+			upstreamStatus: http.StatusOK,
+			wantStatus:     http.StatusOK,
+			wantKeys:       []string{"publicBool", "publicString"},
+		},
+		{
+			name:           "flag on, unauthenticated: bulk response is filtered down to public-metadata flags only",
+			filteringOn:    true,
+			isAuthedUser:   false,
+			upstreamFlags:  flagsByMetadata,
+			upstreamStatus: http.StatusOK,
+			wantStatus:     http.StatusOK,
+			wantKeys:       []string{"publicBool", "publicString"},
+		},
+		{
+			name:           "flag off, authenticated: bulk response is not filtered at all",
+			filteringOn:    false,
+			isAuthedUser:   true,
+			upstreamFlags:  flagsByMetadata,
+			upstreamStatus: http.StatusOK,
+			wantStatus:     http.StatusOK,
+			wantKeys:       []string{"publicBool", "publicString", "privateBool", "noMetadata"},
+		},
+		{
+			name:           "flag off, unauthenticated: bulk response is still filtered down to public-metadata flags (unauth is always gated)",
+			filteringOn:    false,
+			isAuthedUser:   false,
+			upstreamFlags:  flagsByMetadata,
+			upstreamStatus: http.StatusOK,
+			wantStatus:     http.StatusOK,
+			wantKeys:       []string{"publicBool", "publicString"},
+		},
+		{
+			name:           "flag on: a non-200 response from the provider is passed through unfiltered, not decoded",
+			filteringOn:    true,
+			isAuthedUser:   true,
+			upstreamFlags:  nil,
+			upstreamStatus: http.StatusInternalServerError,
+			wantStatus:     http.StatusInternalServerError,
+		},
+		{
+			name:           "flag on: if every flag gets filtered out, the response still has a valid (non-null) empty flags list",
+			filteringOn:    true,
+			isAuthedUser:   true,
+			upstreamFlags:  onlyPrivateFlag,
+			upstreamStatus: http.StatusOK,
+			wantStatus:     http.StatusOK,
+			wantKeys:       []string{},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			setupOpenFeatureFlag(t, featuremgmt.FlagOfrepBulkFlagEvalFiltering, tt.filteringOn)
+			b := newBulkEvalBuilder(t, tt.upstreamFlags, tt.upstreamStatus)
+			w := httptest.NewRecorder()
+			r := httptest.NewRequest(http.MethodPost, "/ofrep/v1/evaluate/flags", strings.NewReader(`{}`))
+
+			b.proxyAllFlagReq(r.Context(), tt.isAuthedUser, "", w, r)
+
+			assert.Equal(t, tt.wantStatus, w.Code)
+			if tt.wantStatus != http.StatusOK {
+				return
+			}
+			var result goffmodel.OFREPBulkEvaluateSuccessResponse
+			require.NoError(t, json.Unmarshal(w.Body.Bytes(), &result))
+			assert.NotNil(t, result.Flags)
+			assert.ElementsMatch(t, tt.wantKeys, decodeBulkFlagKeys(t, w))
+		})
+	}
+}
+
+func TestProxyFlagReq_SingleFlagGate(t *testing.T) {
+	tests := []struct {
+		name         string
+		flagKey      string
+		metadata     map[string]any
+		isAuthedUser bool
+		wantStatus   int
+	}{
+		{
+			name:       "unauthenticated request for a flag marked public in its metadata succeeds",
+			flagKey:    "publicflag",
+			metadata:   map[string]any{"public": true},
+			wantStatus: http.StatusOK,
+		},
+		{
+			name:       "unauthenticated request for a flag without public metadata is rejected with 401",
+			flagKey:    "secretflag",
+			wantStatus: http.StatusUnauthorized,
+		},
+		{
+			name:         "authenticated request succeeds even without public metadata",
+			flagKey:      "secretflag",
+			isAuthedUser: true,
+			wantStatus:   http.StatusOK,
+		},
+	}
+
+	for _, tt := range tests {
+		for _, filteringOn := range []bool{true, false} {
+			t.Run(fmt.Sprintf("%s (filtering=%t)", tt.name, filteringOn), func(t *testing.T) {
+				setupOpenFeatureFlag(t, featuremgmt.FlagOfrepBulkFlagEvalFiltering, filteringOn)
+				b := newSingleEvalBuilder(t, tt.metadata)
+				w := httptest.NewRecorder()
+				r := httptest.NewRequest(http.MethodPost, "/ofrep/v1/evaluate/flags/"+tt.flagKey, strings.NewReader(`{}`))
+
+				b.proxyFlagReq(r.Context(), tt.flagKey, tt.isAuthedUser, "", w, r)
+
+				assert.Equal(t, tt.wantStatus, w.Code)
+			})
+		}
+	}
 }

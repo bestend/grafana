@@ -131,25 +131,33 @@ func TestRootOneFlagHandler_MissingFlagKey(t *testing.T) {
 	assert.Equal(t, http.StatusBadRequest, w.Code)
 }
 
-func TestRootOneFlagHandler_UnauthedNonPublicFlag(t *testing.T) {
-	b := &APIBuilder{
-		providerType: setting.OFREPProviderType,
-		logger:       log.NewNopLogger(),
+func TestOneFlagHandler_UnauthPublicMetadataGate(t *testing.T) {
+	routes := []struct {
+		name string
+		call func(b *APIBuilder, w http.ResponseWriter, r *http.Request)
+	}{
+		{"root", func(b *APIBuilder, w http.ResponseWriter, r *http.Request) { b.rootOneFlagHandler(w, r) }},
+		{"namespaced", func(b *APIBuilder, w http.ResponseWriter, r *http.Request) { b.oneFlagHandler(w, r) }},
+	}
+	tests := []struct {
+		name       string
+		metadata   map[string]any
+		wantStatus int
+	}{
+		{"public flag succeeds", map[string]any{"public": true}, http.StatusOK},
+		{"non-public flag is rejected with 401", nil, http.StatusUnauthorized},
 	}
 
-	req := httptest.NewRequest(http.MethodPost, "/ofrep/v1/evaluate/flags/secretflag", bytes.NewBufferString(`{}`))
-	req = mux.SetURLVars(req, map[string]string{"flagKey": "secretflag"})
-
-	// Unauthenticated requester
-	requester := &identity.StaticRequester{
-		Type: types.TypeUnauthenticated,
+	for _, rt := range routes {
+		for _, tt := range tests {
+			t.Run(rt.name+": "+tt.name, func(t *testing.T) {
+				b := newSingleEvalBuilder(t, tt.metadata)
+				w := httptest.NewRecorder()
+				rt.call(b, w, newUnauthReq("brandnewflag"))
+				assert.Equal(t, tt.wantStatus, w.Code)
+			})
+		}
 	}
-	ctx := types.WithAuthInfo(req.Context(), requester)
-	req = req.WithContext(ctx)
-
-	w := httptest.NewRecorder()
-	b.rootOneFlagHandler(w, req)
-	assert.Equal(t, http.StatusUnauthorized, w.Code)
 }
 
 func TestRootAllFlagsHandler_NamespaceMismatch(t *testing.T) {
