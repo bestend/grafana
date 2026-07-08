@@ -9,31 +9,42 @@ import (
 	"github.com/open-feature/go-sdk/openfeature"
 )
 
+const (
+	SlugKey           = "slug"
+	PlanKey           = "plan"
+	ChannelKey        = "channel"
+	NamespaceKey      = "namespace"
+	GrafanaVersionKey = "grafana_version"
+	StackIdKey        = "stackId"
+	InstanceUrlKey    = "instanceURL"
+)
+
 // InstanceContextFromBaggage extracts per-tenant attributes from OTel baggage
 // and injects them into an OpenFeature evaluation context. The HG gateway
 // populates these baggage members on every proxied request, so MT services get
-// a full per-tenant eval context with no extra metadata API calls. stackId is
+// a full per-tenant eval context with no extra metadata API calls. namespace is
 // used as the targeting key.
 func InstanceContextFromBaggage(ctx context.Context) openfeature.EvaluationContext {
 	bag := baggage.FromContext(ctx)
 
-	attrs := map[string]any{}
-	set := func(attrKey, baggageKey string) {
-		if v := bag.Member(baggageKey).Value(); v != "" {
-			attrs[attrKey] = v
+	contextAtributes := map[string]any{}
+
+	set := func(attrKey string) {
+		if v := bag.Member(attrKey).Value(); v != "" {
+			contextAtributes[attrKey] = v
 		}
 	}
 
-	set("slug", "slug")
-	set("plan", "plan")
-	set("channel", "channel")
-	set("namespace", "namespace")
-	set("grafana_version", "grafana_version")
-	set("stackId", "stackId")
-	set("instanceURL", "instanceURL")
+	set(SlugKey)
+	set(PlanKey)
+	set(ChannelKey)
+	set(NamespaceKey)
+	set(GrafanaVersionKey)
+	set(StackIdKey)
+	set(InstanceUrlKey)
 
-	targetingKey := bag.Member("stackId").Value()
-	return openfeature.NewEvaluationContext(targetingKey, attrs)
+	targetingKey := bag.Member(NamespaceKey).Value()
+	return openfeature.NewEvaluationContext(targetingKey, contextAtributes)
 }
 
 // WithTransactionContextMiddleware is an HTTP middleware that reads OTel baggage
