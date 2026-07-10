@@ -21,7 +21,6 @@ import (
 	"k8s.io/client-go/rest"
 
 	annotationV0 "github.com/grafana/grafana/apps/annotation/pkg/apis/annotation/v0alpha1"
-	annotationpkg "github.com/grafana/grafana/pkg/registry/apps/annotation"
 	"github.com/grafana/grafana/pkg/services/annotations"
 	"github.com/grafana/grafana/pkg/services/apiserver/client"
 	"github.com/grafana/grafana/pkg/services/user"
@@ -111,34 +110,63 @@ func (s *annotationAPIClient) Delete(ctx context.Context, orgID int64, name stri
 	return s.k8sClient.Delete(ctx, name, orgID, v1.DeleteOptions{})
 }
 
+// GetByLegacyID fetches an annotation by its legacy ID, returning a tombstone if it has been soft-deleted.
+//
 // TODO: expensive — the legacyID index does not cover the time partition, so this scans
 // every partition. Carrying the annotation time to the call sites would let us prune them.
 func (s *annotationAPIClient) GetByLegacyID(ctx context.Context, orgID int64, annotationID int64) (*annotationV0.Annotation, error) {
-	list, err := s.k8sClient.List(ctx, orgID, v1.ListOptions{
-		LabelSelector: fmt.Sprintf("%s=%d", annotationpkg.LabelKeyLegacyID, annotationID),
-	})
-	if err != nil {
-		return nil, err
-	}
-	if len(list.Items) == 0 {
-		return nil, ErrNotFound
-	}
-	return fromUnstructured(&list.Items[0])
-}
-
-func (s *annotationAPIClient) GetUsersFromMeta(ctx context.Context, usersMeta []string) (map[string]*user.User, error) {
-	return s.k8sClient.GetUsersFromMeta(ctx, usersMeta)
-}
-
-// Search calls the /search custom route, which handles all filtering server-side including tags.
-func (s *annotationAPIClient) Search(ctx context.Context, orgID int64, query *annotations.ItemQuery) ([]*annotationV0.Annotation, error) {
 	rc, err := s.getRESTClient()
 	if err != nil {
 		return nil, err
 	}
 
 	namespace := s.k8sClient.GetNamespace(orgID)
-	req := rc.Get().AbsPath("apis", annotationV0.APIGroup, annotationV0.APIVersion, "namespaces", namespace, "search")
+	raw, err := rc.Get().
+		AbsPath("apis", annotationV0.APIGroup, annotationV0.APIVersion, "namespaces", namespace, "search").
+		Param("legacyID", strconv.FormatInt(annotationID, 10)).
+		Param("deleted", "include"). // include the tombstone so callers can detect a soft-delete
+		DoRaw(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	var list annotationV0.AnnotationList
+	if err := json.Unmarshal(raw, &list); err != nil {
+		return nil, fmt.Errorf("decode search response: %w", err)
+	}
+	if len(list.Items) == 0 {
+		return nil, ErrNotFound
+	}
+	return &list.Items[0], nil
+}
+
+func (s *annotationAPIClient) GetUsersFromMeta(ctx context.Context, usersMeta []string) (map[string]*user.User, error) {
+	return s.k8sClient.GetUsersFromMeta(ctx, usersMeta)
+}
+
+// Search calls the /search custom route for live annotations only. Filtering,
+// including tags, is handled server-side. The caller's limit applies to live
+// results alone — tombstones do not consume slots.
+func (s *annotationAPIClient) Search(ctx context.Context, orgID int64, query *annotations.ItemQuery) ([]*annotationV0.Annotation, error) {
+	return s.search(ctx, orgID, query, false)
+}
+
+// SearchDeleted returns the tombstones matching the query. It ignores the caller's
+// limit: the result suppresses legacy duplicates from a merge, so it must be complete
+// for the window rather than truncated to a display limit.
+func (s *annotationAPIClient) SearchDeleted(ctx context.Context, orgID int64, query *annotations.ItemQuery) ([]*annotationV0.Annotation, error) {
+	return s.search(ctx, orgID, query, true)
+}
+
+func (s *annotationAPIClient) search(ctx context.Context, orgID int64, query *annotations.ItemQuery, deletedOnly bool) ([]*annotationV0.Annotation, error) {
+	rc, err := s.getRESTClient()
+	if err != nil {
+		return nil, err
+	}
+
+	namespace := s.k8sClient.GetNamespace(orgID)
+	req := rc.Get().
+		AbsPath("apis", annotationV0.APIGroup, annotationV0.APIVersion, "namespaces", namespace, "search")
 
 	if query.DashboardUID != "" {
 		req = req.Param("dashboardUID", query.DashboardUID)
@@ -152,7 +180,7 @@ func (s *annotationAPIClient) Search(ctx context.Context, orgID int64, query *an
 	if query.To != 0 {
 		req = req.Param("to", strconv.FormatInt(query.To, 10))
 	}
-	if query.Limit != 0 {
+	if query.Limit != 0 && !deletedOnly {
 		req = req.Param("limit", strconv.FormatInt(query.Limit, 10))
 	}
 	for _, tag := range query.Tags {
@@ -163,6 +191,9 @@ func (s *annotationAPIClient) Search(ctx context.Context, orgID int64, query *an
 	}
 	if query.UserUID != "" {
 		req = req.Param("createdBy", query.UserUID)
+	}
+	if deletedOnly {
+		req = req.Param("deleted", "only")
 	}
 
 	raw, err := req.DoRaw(ctx)
